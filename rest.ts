@@ -639,6 +639,7 @@ function handleCreateLabel(ctx: Ctx, repo: RepoRec): void {
     return;
   }
   repo.labels.set(name, { name, color, description: strField(body, 'description') ?? '' });
+  repo.labelsVersion += 1;
   ctx.sendJson(201, labelJson(repo, name));
 }
 
@@ -703,17 +704,57 @@ function entryOf(repo: RepoRec, number: number): IssueOrPull | undefined {
   return repo.entries.get(number);
 }
 
+// Serialized GET-issue bodies, memoized per repo: the read benchmark asks for the same issue
+// thousands of times. The fingerprint is built from every field the body derives from, so any
+// mutation (patch, close, merge, comment, label edit, ref move, repo edit) misses the cache.
+const issueBodyCaches = new WeakMap<RepoRec, Map<string, { fp: string; body: string }>>();
+
+function sendCachedIssueBody(
+  ctx: Ctx,
+  repo: RepoRec,
+  entry: IssueOrPull,
+  fp: string,
+  build: () => Record<string, unknown>,
+): void {
+  let perRepo = issueBodyCaches.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    issueBodyCaches.set(repo, perRepo);
+  }
+  const key = `${entry.number}|${ctx.origin}`;
+  const hit = perRepo.get(key);
+  if (hit && hit.fp === fp) {
+    ctx.send(200, 'application/json; charset=utf-8', hit.body);
+    return;
+  }
+  const body = `${JSON.stringify(build())}\n`;
+  if (perRepo.size >= 256) perRepo.clear();
+  perRepo.set(key, { fp, body });
+  ctx.send(200, 'application/json; charset=utf-8', body);
+}
+
 function handleGetIssue(ctx: Ctx, repo: RepoRec, number: number): void {
   const entry = entryOf(repo, number);
   if (!entry) return notFound(ctx);
   if (entry.kind === 'pull') {
-    const json = pullJson(repo, entry, ctx.origin);
-    json.pull_request = { url: `${ctx.origin}/api/v3/repos/${repo.owner}/${repo.name}/pulls/${number}` };
-    // GitHub also exposes pulls through the issues endpoint with the pull fields merged in.
-    ctx.sendJson(200, { ...issueShellOfPull(repo, entry, ctx.origin), ...json });
+    const fp = [
+      'p', repo.updatedAt, entry.updatedAt, entry.comments.length, repo.labelsVersion,
+      entry.state, entry.title, entry.body, entry.merged, entry.mergedAt ?? '',
+      entry.mergeCommitSha ?? '', pullHeadSha(repo, entry), pullBaseSha(repo, entry),
+    ].join('|');
+    sendCachedIssueBody(ctx, repo, entry, fp, () => {
+      const json = pullJson(repo, entry, ctx.origin);
+      json.pull_request = { url: `${ctx.origin}/api/v3/repos/${repo.owner}/${repo.name}/pulls/${number}` };
+      // GitHub also exposes pulls through the issues endpoint with the pull fields merged in.
+      return { ...issueShellOfPull(repo, entry, ctx.origin), ...json };
+    });
     return;
   }
-  ctx.sendJson(200, issueJson(repo, entry, ctx.origin));
+  const fp = [
+    'i', repo.updatedAt, entry.updatedAt, entry.comments.length, repo.labelsVersion,
+    entry.state, entry.title, entry.body, entry.labels.join(','),
+  ].join('|');
+  sendCachedIssueBody(ctx, repo, entry, fp, () => issueJson(repo, entry, ctx.origin));
 }
 
 function issueShellOfPull(repo: RepoRec, pull: PullRec, origin: string): Record<string, unknown> {

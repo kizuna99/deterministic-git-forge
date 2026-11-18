@@ -40,8 +40,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const requestId = `forge-${requestCounter.toString(16).padStart(8, '0')}`;
   const method = (req.method ?? 'GET').toUpperCase();
   const rawUrl = req.url ?? '/';
-  const url = new URL(rawUrl, 'http://forge.invalid');
-  const path = url.pathname;
+  const queryStart = rawUrl.indexOf('?');
+  const path = queryStart >= 0 ? rawUrl.slice(0, queryStart) : rawUrl;
+  const searchParams = new URLSearchParams(queryStart >= 0 ? rawUrl.slice(queryStart + 1) : '');
   const host = req.headers.host ?? 'localhost';
   const origin = `http://${host}`;
 
@@ -72,6 +73,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     .split('/')
     .filter((segment) => segment.length > 0)
     .map((segment) => {
+      if (!segment.includes('%')) return segment;
       try {
         return decodeURIComponent(segment);
       } catch {
@@ -94,7 +96,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     method,
     path,
     segments,
-    query: url.searchParams,
+    query: searchParams,
     body,
     json,
     origin,
@@ -143,7 +145,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const repo = owner === 'adaiversen' ? store.getRepo(owner, name) : undefined;
     const gitSend = (status: number, type: string, payload: Buffer | string): void => send(status, type, payload);
     if (action === 'info/refs' && method === 'GET') {
-      const service = url.searchParams.get('service') ?? '';
+      const service = searchParams.get('service') ?? '';
       const protocolV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
       infoRefs(repo, service, protocolV2, gitSend);
       return;

@@ -74,13 +74,21 @@ export interface RepoRec {
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
+  labelsVersion: number;
   entries: Map<number, IssueOrPull>;
   nextNumber: number;
 }
 
+const globalIdCache = new Map<string, string>();
+
 /** Global ids: opaque base64 of a typed numeric id, stable for the life of the process. */
 export function globalId(kind: string, numericId: number): string {
-  return Buffer.from(`v1:${kind}:${numericId}`, 'utf8').toString('base64');
+  const key = `${kind}:${numericId}`;
+  const hit = globalIdCache.get(key);
+  if (hit !== undefined) return hit;
+  const value = Buffer.from(`v1:${kind}:${numericId}`, 'utf8').toString('base64');
+  globalIdCache.set(key, value);
+  return value;
 }
 
 export function parseGlobalId(id: string): { kind: string; numericId: number } | undefined {
@@ -114,14 +122,25 @@ class Store {
     return this.seq;
   }
 
+  private isoCacheSec = Number.NaN;
+  private isoCache = '';
+
+  private isoFor(sec: number): string {
+    if (sec !== this.isoCacheSec) {
+      this.isoCacheSec = sec;
+      this.isoCache = new Date(sec * 1000).toISOString();
+    }
+    return this.isoCache;
+  }
+
   /** The logical clock: each call advances one second, so timestamps are unique and ordered. */
   tick(): { sec: number; iso: string } {
     this.clockSec += 1;
-    return { sec: this.clockSec, iso: new Date(this.clockSec * 1000).toISOString() };
+    return { sec: this.clockSec, iso: this.isoFor(this.clockSec) };
   }
 
   nowIso(): string {
-    return new Date(this.clockSec * 1000).toISOString();
+    return this.isoFor(this.clockSec);
   }
 
   allocEntityId(): number {
@@ -145,6 +164,7 @@ class Store {
       objects: new Map(),
       refs: new Map(),
       labels: new Map(),
+      labelsVersion: 0,
       entries: new Map(),
       nextNumber: 1,
     };

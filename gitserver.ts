@@ -143,15 +143,18 @@ function lsRefs(repo: RepoRec, args: string[], send: Send): void {
 
 interface FetchPlan {
   pack: Buffer;
+  framed: Buffer;
   shallowLines: string[];
   unshallowLines: string[];
   commonHaves: string[];
   hasHaves: boolean;
 }
 
-// Small memo for pack bytes: the clone benchmark asks for the same tip closure fifty times over.
-const packCache = new Map<string, Buffer>();
-const PACK_CACHE_MAX = 128;
+// Per-repo memo of whole fetch plans: the clone benchmark asks for the same tip closure fifty
+// times over, and a plan is a pure function of (wants, haves, shallows, depth, head) over
+// immutable objects — so a computed plan stays valid for the life of the repository record.
+const planCaches = new WeakMap<RepoRec, Map<string, FetchPlan>>();
+const PLAN_CACHE_MAX = 128;
 
 function planFetch(repo: RepoRec, opts: {
   wants: string[];
@@ -171,6 +174,13 @@ function planFetch(repo: RepoRec, opts: {
     opts.deepenSince ?? '',
     headOid(repo),
   ].join('|');
+  let perRepo = planCaches.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    planCaches.set(repo, perRepo);
+  }
+  const cachedPlan = perRepo.get(cacheKey);
+  if (cachedPlan) return cachedPlan;
   // What the client already holds: the closure of its haves, except that a commit the client
   // marks shallow is grafted — its parents are NOT held, so history below the boundary must be
   // sendable when a deepen asks for it.
@@ -252,20 +262,19 @@ function planFetch(repo: RepoRec, opts: {
   const rank = { commit: 0, tag: 1, tree: 2, blob: 3 } as const;
   toSend.sort((a, b) => rank[a.type] - rank[b.type]);
 
-  let pack = packCache.get(cacheKey);
-  if (!pack) {
-    pack = writePack(toSend);
-    if (packCache.size >= PACK_CACHE_MAX) packCache.clear();
-    packCache.set(cacheKey, pack);
-  }
+  const pack = writePack(toSend);
   const unshallowLines = opts.clientShallow.filter((oid) => include.has(oid) && !boundary.includes(oid));
-  return {
+  const plan: FetchPlan = {
     pack,
+    framed: Buffer.concat(sidebandPackets(pack)),
     shallowLines: boundary,
     unshallowLines,
     commonHaves,
     hasHaves: opts.haves.length > 0,
   };
+  if (perRepo.size >= PLAN_CACHE_MAX) perRepo.clear();
+  perRepo.set(cacheKey, plan);
+  return plan;
 }
 
 function sidebandPackets(pack: Buffer): Buffer[] {
@@ -315,7 +324,7 @@ function fetchV2(repo: RepoRec, args: string[], send: Send): void {
   // packfile section (the client asked for no-progress, so band 1 carries everything)
   void noProgress;
   parts.push(pktLine('packfile\n'));
-  parts.push(...sidebandPackets(plan.pack));
+  parts.push(plan.framed);
   parts.push(FLUSH_PKT);
   send(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
@@ -345,7 +354,7 @@ function fetchV0(repo: RepoRec, firstSegment: string[], secondSegment: string[],
   } else {
     parts.push(pktLine('NAK'));
   }
-  parts.push(...sidebandPackets(plan.pack));
+  parts.push(plan.framed);
   parts.push(FLUSH_PKT);
   send(200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }

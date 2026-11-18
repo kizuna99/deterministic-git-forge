@@ -57,7 +57,18 @@ function parseIdent(line: string): { name: string; email: string; time: number }
   return { name, email, time };
 }
 
+const commitParseCache = new WeakMap<Buffer, CommitInfo>();
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+
 export function parseCommit(data: Buffer): CommitInfo {
+  const hit = commitParseCache.get(data);
+  if (hit) return hit;
+  const info = parseCommitUncached(data);
+  commitParseCache.set(data, info);
+  return info;
+}
+
+function parseCommitUncached(data: Buffer): CommitInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split >= 0 ? text.slice(0, split) : text;
@@ -118,6 +129,14 @@ export interface TreeEntry {
 }
 
 export function parseTree(data: Buffer): TreeEntry[] {
+  const hit = treeParseCache.get(data);
+  if (hit) return hit;
+  const entries = parseTreeUncached(data);
+  treeParseCache.set(data, entries);
+  return entries;
+}
+
+function parseTreeUncached(data: Buffer): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -509,7 +528,7 @@ export function writePack(objects: Array<{ oid: string; type: ObjType; data: Buf
       headBytes.push(byte);
     }
     parts.push(Buffer.from(headBytes));
-    parts.push(deflateSync(obj.data));
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -520,6 +539,18 @@ export interface PackObject {
   oid: string;
   type: ObjType;
   data: Buffer;
+}
+
+/**
+ * Inflate one deflate stream from the front of `slice`, reporting how many compressed bytes it
+ * consumed — a single pass, where the old code probed prefix lengths with throwing calls.
+ */
+function inflateOnce(slice: Buffer): { data: Buffer; consumed: number } {
+  const out = inflateSync(slice, { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  return { data: out.buffer, consumed: out.engine.bytesWritten };
 }
 
 /**
@@ -572,9 +603,9 @@ export function readPack(pack: Buffer, base: Lookup): PackObject[] {
       const back = readVarintOffset();
       const baseObj = byOffset.get(objectStart - back);
       if (!baseObj) throw new Error('ofs-delta base missing');
-      const delta = inflateSync(pack.subarray(offset, dataEnd));
-      offset += consumedInflateLength(pack, offset, dataEnd);
-      resolved = { type: baseObj.type, data: applyDelta(baseObj.data, delta) };
+      const inflated = inflateOnce(pack.subarray(offset, dataEnd));
+      offset += inflated.consumed;
+      resolved = { type: baseObj.type, data: applyDelta(baseObj.data, inflated.data) };
     } else if (typeId === 7) {
       // REF_DELTA
       const baseOid = pack.toString('hex', offset, offset + 20);
@@ -582,16 +613,16 @@ export function readPack(pack: Buffer, base: Lookup): PackObject[] {
       const inPack = byOid.get(baseOid);
       const stored = inPack ?? (base(baseOid) ? { type: (base(baseOid) as GitObject).type, data: (base(baseOid) as GitObject).data } : undefined);
       if (!stored) throw new Error('ref-delta base missing');
-      const delta = inflateSync(pack.subarray(offset, dataEnd));
-      offset += consumedInflateLength(pack, offset, dataEnd);
-      resolved = { type: stored.type, data: applyDelta(stored.data, delta) };
+      const inflated = inflateOnce(pack.subarray(offset, dataEnd));
+      offset += inflated.consumed;
+      resolved = { type: stored.type, data: applyDelta(stored.data, inflated.data) };
     } else {
       const type = TYPE_IDS[typeId];
       if (!type) throw new Error(`unknown pack object type ${typeId}`);
-      const data = inflateSync(pack.subarray(offset, dataEnd));
-      offset += consumedInflateLength(pack, offset, dataEnd);
-      if (data.length !== size) throw new Error('pack object size mismatch');
-      resolved = { type, data };
+      const inflated = inflateOnce(pack.subarray(offset, dataEnd));
+      offset += inflated.consumed;
+      if (inflated.data.length !== size) throw new Error('pack object size mismatch');
+      resolved = { type, data: inflated.data };
     }
     const oid = hashObject(resolved.type, resolved.data);
     const record: PackObject = { oid, type: resolved.type, data: resolved.data };
@@ -599,28 +630,6 @@ export function readPack(pack: Buffer, base: Lookup): PackObject[] {
     byOid.set(oid, record);
   }
   return [...byOid.values()];
-}
-
-/**
- * Length of the deflate stream starting at `offset`. zlib's inflateSync does not report consumed
- * bytes, but a truncated stream throws while an exact or longer prefix inflates (trailing bytes
- * are ignored), so the stream's length is the smallest prefix that inflates successfully.
- */
-function consumedInflateLength(pack: Buffer, offset: number, end: number): number {
-  let lo = 1;
-  let hi = end - offset;
-  let best = hi;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(pack.subarray(offset, offset + mid));
-      best = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return best;
 }
 
 /** Apply a git delta buffer to a base payload. */
