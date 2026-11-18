@@ -1,9 +1,15 @@
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/kizuna99/deterministic-git-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/kizuna99/deterministic-git-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 # Deterministic Git Forge — Git, REST, GraphQL & MCP in one process
 
 A standalone, GitHub-compatible git forge written in TypeScript on the Node 22
 standard library alone. One process, one in-memory store, no git binary, no
 network calls, no install step: `node main.ts` binds an ephemeral port,
 registers it with the harness, and serves four surfaces until told to stop.
+
+Built for the [make.fun "Build a GitHub-compatible git forge" bounty](https://make.fun/bounty/github-core-clone-01).
 
 ## Surfaces
 
