@@ -134,6 +134,20 @@ export function issueJson(repo: RepoRec, issue: IssueRec, origin: string): Recor
   };
 }
 
+const VIEWER_JSON = `{"login":${JSON.stringify(VIEWER_LOGIN)},"id":${VIEWER_ID},"type":"User"}`;
+
+function labelJsonString(repo: RepoRec, name: string): string {
+  const label = repo.labels.get(name);
+  return `{"id":0,"node_id":"","name":${JSON.stringify(name)},"color":${JSON.stringify(label?.color ?? 'ededed')},"description":${JSON.stringify(label?.description ?? '')},"default":false}`;
+}
+
+/** issueJson rendered directly to its JSON text — byte-identical, without the object round-trip. */
+export function issueJsonString(repo: RepoRec, issue: IssueRec, origin: string): string {
+  const labels = issue.labels.map((name) => labelJsonString(repo, name)).join(',');
+  const closedAt = issue.state === 'closed' ? JSON.stringify(issue.updatedAt) : 'null';
+  return `{"id":${issue.id},"node_id":${JSON.stringify(globalId('issue', issue.id))},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":${JSON.stringify(issue.state)},"labels":[${labels}],"user":${VIEWER_JSON},"author":${VIEWER_JSON},"comments":${issue.comments.length},"created_at":${JSON.stringify(issue.createdAt)},"updated_at":${JSON.stringify(issue.updatedAt)},"closed_at":${closedAt},"html_url":${JSON.stringify(`${origin}/${repo.owner}/${repo.name}/issues/${issue.number}`)},"repository_url":${JSON.stringify(`${origin}/api/v3/repos/${repo.owner}/${repo.name}`)}}`;
+}
+
 export function pullJson(repo: RepoRec, pull: PullRec, origin: string): Record<string, unknown> {
   const headSha = pullHeadSha(repo, pull);
   const baseSha = pullBaseSha(repo, pull);
@@ -398,6 +412,7 @@ function handleCreateRef(ctx: Ctx, repo: RepoRec): void {
     return;
   }
   repo.refs.set(ref, sha);
+  repo.refsVersion += 1;
   ctx.sendJson(201, { ref, node_id: '', object: { sha, type: obj.type } });
 }
 
@@ -540,6 +555,7 @@ function writeContents(
   });
   const commitSha = put('commit', commitData);
   repo.refs.set(`refs/heads/${branch}`, commitSha);
+  repo.refsVersion += 1;
   repo.updatedAt = store.tick().iso;
   return { status: created ? 201 : 200, commitSha, blobOid: newData ? flat.get(path)?.oid ?? '' : '', created };
 }
@@ -682,7 +698,7 @@ function handleCreateIssue(ctx: Ctx, repo: RepoRec): void {
     body: strField(body, 'body') ?? '',
     labels,
   });
-  ctx.sendJson(201, issueJson(repo, issue, ctx.origin));
+  ctx.send(201, 'application/json; charset=utf-8', `${issueJsonString(repo, issue, ctx.origin)}\n`);
 }
 
 function sortedIssues(repo: RepoRec, kind: 'issue' | 'pull'): IssueOrPull[] {
@@ -714,7 +730,7 @@ function sendCachedIssueBody(
   repo: RepoRec,
   entry: IssueOrPull,
   fp: string,
-  build: () => Record<string, unknown>,
+  build: () => string,
 ): void {
   let perRepo = issueBodyCaches.get(repo);
   if (!perRepo) {
@@ -727,7 +743,7 @@ function sendCachedIssueBody(
     ctx.send(200, 'application/json; charset=utf-8', hit.body);
     return;
   }
-  const body = `${JSON.stringify(build())}\n`;
+  const body = `${build()}\n`;
   if (perRepo.size >= 256) perRepo.clear();
   perRepo.set(key, { fp, body });
   ctx.send(200, 'application/json; charset=utf-8', body);
@@ -746,7 +762,7 @@ function handleGetIssue(ctx: Ctx, repo: RepoRec, number: number): void {
       const json = pullJson(repo, entry, ctx.origin);
       json.pull_request = { url: `${ctx.origin}/api/v3/repos/${repo.owner}/${repo.name}/pulls/${number}` };
       // GitHub also exposes pulls through the issues endpoint with the pull fields merged in.
-      return { ...issueShellOfPull(repo, entry, ctx.origin), ...json };
+      return JSON.stringify({ ...issueShellOfPull(repo, entry, ctx.origin), ...json });
     });
     return;
   }
@@ -754,7 +770,7 @@ function handleGetIssue(ctx: Ctx, repo: RepoRec, number: number): void {
     'i', repo.updatedAt, entry.updatedAt, entry.comments.length, repo.labelsVersion,
     entry.state, entry.title, entry.body, entry.labels.join(','),
   ].join('|');
-  sendCachedIssueBody(ctx, repo, entry, fp, () => issueJson(repo, entry, ctx.origin));
+  sendCachedIssueBody(ctx, repo, entry, fp, () => issueJsonString(repo, entry, ctx.origin));
 }
 
 function issueShellOfPull(repo: RepoRec, pull: PullRec, origin: string): Record<string, unknown> {
@@ -798,7 +814,7 @@ function handlePatchIssue(ctx: Ctx, repo: RepoRec, number: number): void {
   }
   entry.updatedAt = store.tick().iso;
   if (entry.kind === 'pull') ctx.sendJson(200, pullJson(repo, entry, ctx.origin));
-  else ctx.sendJson(200, issueJson(repo, entry, ctx.origin));
+  else ctx.send(200, 'application/json; charset=utf-8', `${issueJsonString(repo, entry, ctx.origin)}\n`);
 }
 
 function handleCreateComment(ctx: Ctx, repo: RepoRec, number: number): void {

@@ -260,6 +260,7 @@ export function mergePullRecord(repo: RepoRec, pull: PullRec): MergeResult {
   });
   const sha = put('commit', commitData);
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+  repo.refsVersion += 1;
   const stamp = store.tick();
   pull.state = 'closed';
   pull.merged = true;

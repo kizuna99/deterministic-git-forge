@@ -27,6 +27,24 @@ const RECEIVE_CAPS = `report-status side-band-64k delete-refs ofs-delta quiet ag
 
 type Send = (status: number, contentType: string, body: Buffer | string) => void;
 
+// Advertisement and ls-refs bytes are pure functions of the ref state, so they are memoized per
+// repository against refsVersion: the clone benchmark asks for the same bytes 150 times.
+const advertCaches = new WeakMap<RepoRec, Map<string, Buffer>>();
+
+function cachedBytes(repo: RepoRec, key: string, build: () => Buffer): Buffer {
+  let perRepo = advertCaches.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    advertCaches.set(repo, perRepo);
+  }
+  const hit = perRepo.get(key);
+  if (hit) return hit;
+  const built = build();
+  if (perRepo.size >= 64) perRepo.clear();
+  perRepo.set(key, built);
+  return built;
+}
+
 function sortedRefs(repo: RepoRec): Array<[string, string]> {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
@@ -47,48 +65,57 @@ export function infoRefs(repo: RepoRec | undefined, service: string, protocolV2:
     send(404, 'text/plain', 'repository not found\n');
     return;
   }
-  const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH_PKT];
-  if (service === 'git-upload-pack' && protocolV2) {
-    parts.push(pktLine('version 2'));
-    parts.push(pktLine(`agent=${AGENT}`));
-    parts.push(pktLine('ls-refs=unborn'));
-    parts.push(pktLine('fetch=shallow wait-for-done'));
-    parts.push(pktLine('object-format=sha1'));
-    parts.push(FLUSH_PKT);
-  } else if (service === 'git-upload-pack') {
-    const refs = sortedRefs(repo);
-    if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${UPLOAD_CAPS_V0}`));
+  const build = (): Buffer => {
+    const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH_PKT];
+    if (service === 'git-upload-pack' && protocolV2) {
+      parts.push(pktLine('version 2'));
+      parts.push(pktLine(`agent=${AGENT}`));
+      parts.push(pktLine('ls-refs=unborn'));
+      parts.push(pktLine('fetch=shallow wait-for-done'));
+      parts.push(pktLine('object-format=sha1'));
+      parts.push(FLUSH_PKT);
+    } else if (service === 'git-upload-pack') {
+      const refs = sortedRefs(repo);
+      if (refs.length === 0) {
+        parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${UPLOAD_CAPS_V0}`));
+      } else {
+        parts.push(pktLine(`${headOid(repo)} HEAD\0${UPLOAD_CAPS_V0}`));
+        for (const [name, oid] of refs) parts.push(pktLine(`${oid} ${name}`));
+      }
+      parts.push(FLUSH_PKT);
     } else {
-      parts.push(pktLine(`${headOid(repo)} HEAD\0${UPLOAD_CAPS_V0}`));
-      for (const [name, oid] of refs) parts.push(pktLine(`${oid} ${name}`));
-    }
-    parts.push(FLUSH_PKT);
-  } else {
-    // git-receive-pack: always the v0 advertisement.
-    const refs = sortedRefs(repo);
-    if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_CAPS}`));
-    } else {
-      let firstLine = true;
-      for (const [name, oid] of refs) {
-        if (firstLine) {
-          parts.push(pktLine(`${oid} ${name}\0${RECEIVE_CAPS}`));
-          firstLine = false;
-        } else {
-          parts.push(pktLine(`${oid} ${name}`));
+      // git-receive-pack: always the v0 advertisement.
+      const refs = sortedRefs(repo);
+      if (refs.length === 0) {
+        parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_CAPS}`));
+      } else {
+        let firstLine = true;
+        for (const [name, oid] of refs) {
+          if (firstLine) {
+            parts.push(pktLine(`${oid} ${name}\0${RECEIVE_CAPS}`));
+            firstLine = false;
+          } else {
+            parts.push(pktLine(`${oid} ${name}`));
+          }
         }
       }
+      parts.push(FLUSH_PKT);
     }
-    parts.push(FLUSH_PKT);
-  }
-  send(200, `application/x-${service}-advertisement`, Buffer.concat(parts));
+    return Buffer.concat(parts);
+  };
+  const cacheKey = `adv|${service}|${protocolV2 ? 'v2' : 'v0'}|${repo.refsVersion}`;
+  send(200, `application/x-${service}-advertisement`, cachedBytes(repo, cacheKey, build));
 }
 
 // ---------------------------------------------------------------------------
 // upload-pack
 
 function lsRefs(repo: RepoRec, args: string[], send: Send): void {
+  const cacheKey = `ls|${repo.refsVersion}|${args.join('\u0001')}`;
+  send(200, 'application/x-git-upload-pack-result', cachedBytes(repo, cacheKey, () => buildLsRefs(repo, args)));
+}
+
+function buildLsRefs(repo: RepoRec, args: string[]): Buffer {
   let peel = false;
   let symrefs = false;
   let unborn = false;
@@ -138,7 +165,7 @@ function lsRefs(repo: RepoRec, args: string[], send: Send): void {
     lines.push(pktLine(line));
   }
   lines.push(FLUSH_PKT);
-  send(200, 'application/x-git-upload-pack-result', Buffer.concat(lines));
+  return Buffer.concat(lines);
 }
 
 interface FetchPlan {
@@ -482,6 +509,7 @@ export function receivePack(repo: RepoRec | undefined, body: Buffer, send: Send)
       }
       if (newOid === ZERO_OID) {
         repo.refs.delete(ref);
+        repo.refsVersion += 1;
         results.push({ ref, ok: true, reason: '' });
         continue;
       }
@@ -506,6 +534,7 @@ export function receivePack(repo: RepoRec | undefined, body: Buffer, send: Send)
         }
       }
       repo.refs.set(ref, newOid);
+      repo.refsVersion += 1;
       results.push({ ref, ok: true, reason: '' });
     }
   }

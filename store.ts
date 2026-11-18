@@ -75,6 +75,7 @@ export interface RepoRec {
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
   labelsVersion: number;
+  refsVersion: number;
   entries: Map<number, IssueOrPull>;
   nextNumber: number;
 }
@@ -165,6 +166,7 @@ class Store {
       refs: new Map(),
       labels: new Map(),
       labelsVersion: 0,
+      refsVersion: 0,
       entries: new Map(),
       nextNumber: 1,
     };
